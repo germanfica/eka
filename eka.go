@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -27,8 +28,6 @@ const (
 	MaximumDownloadBytes int64 = 100 * 1024 * 1024
 	DownloadTimeout            = 3 * time.Minute
 )
-
-var rolloHeadingPattern = regexp.MustCompile(`(?i)^rollo[[:space:]]*(?:n[º°]|№|#)?[[:space:]]*([0-9]{1,2})[[:space:]]*$`)
 
 type Configuration struct {
 	SourcePDF            string
@@ -318,34 +317,268 @@ func ExtractTextFromSourcePDF(executable string, sourcePDFPath string, destinati
 	return nil
 }
 
+// NormalizeExtractedText prepares a reading copy. original.txt is never changed.
+// Physical PDF lines are joined, running headers are removed and page labels
+// remain visible without forcing a paragraph break at each page boundary.
 func NormalizeExtractedText(sourceText string) string {
 	text := strings.ReplaceAll(sourceText, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
-	text = strings.ReplaceAll(text, "\f", "\n\n")
+	text = strings.ReplaceAll(text, "\u00ad", "")
+	text = SplitSignatureAndRolloHeadings(text)
+	text = SplitInlineRolloHeadings(text)
 
-	var builder strings.Builder
-	for _, character := range text {
-		if character == '\n' || character == '\t' || character >= 32 {
-			if character != '\u00ad' { // Remove a soft hyphen, not an ordinary visible hyphen.
-				builder.WriteRune(character)
-			}
+	var result strings.Builder
+	lines := strings.Split(text, "\n")
+	inMainText := false
+	seenDocumentTitle := false
+	pendingPageNumber := 0
+	pendingBlankLines := 0
+	paragraph := ""
+
+	flushParagraph := func() {
+		if paragraph != "" {
+			result.WriteString(paragraph)
+			result.WriteString("\n\n")
+			paragraph = ""
 		}
 	}
 
-	lines := strings.Split(builder.String(), "\n")
-	for index := 0; index < len(lines); index++ {
-		lines[index] = strings.TrimRight(lines[index], " \t")
+	for _, sourceLine := range lines {
+		line := strings.TrimSpace(sourceLine)
+		if strings.Contains(line, "\f") {
+			line = strings.TrimSpace(strings.ReplaceAll(line, "\f", ""))
+			pendingBlankLines = 0
+		}
+		if line == "" {
+			pendingBlankLines++
+			continue
+		}
+		if number, found := ParsePrintedPageNumber(line); found {
+			pendingPageNumber = number
+			pendingBlankLines = 0
+			continue
+		}
+		if line == "EKA TANTRA" {
+			if seenDocumentTitle {
+				pendingBlankLines = 0
+				continue
+			}
+			seenDocumentTitle = true
+		}
+		if line == "DOCTRINA TRASCENDENTAL DE LA UNIDAD" {
+			pendingBlankLines = 0
+			continue
+		}
+
+		if !inMainText {
+			if number, found := ParseRolloHeading(line); found && number == 1 {
+				inMainText = true
+			} else {
+				result.WriteString(line)
+				result.WriteByte('\n')
+				continue
+			}
+		}
+
+		if IsReadingHeading(line) {
+			flushParagraph()
+			if number, found := ParseRolloHeading(line); found {
+				fmt.Fprintf(&result, "Rollo %d\n\n", number)
+			} else if IsSignatureLine(line) {
+				result.WriteString("Shiva y Shakti\n\n")
+			} else {
+				result.WriteString(line)
+				result.WriteString("\n\n")
+			}
+			pendingBlankLines = 0
+			continue
+		}
+
+		// The PDF sometimes prints the page number at the bottom of the
+		// previous page. Keep just the latest label before new prose.
+		if pendingPageNumber > 0 {
+			line = InsertPageMarkerAfterFirstWord(line, pendingPageNumber)
+			pendingPageNumber = 0
+		}
+		if pendingBlankLines >= 2 && paragraph != "" {
+			flushParagraph()
+		}
+		pendingBlankLines = 0
+		paragraph = JoinWrappedLine(paragraph, line)
 	}
-	return strings.TrimSpace(strings.Join(lines, "\n")) + "\n"
+	flushParagraph()
+	return strings.TrimSpace(result.String()) + "\n"
+}
+
+func ParsePrintedPageNumber(line string) (int, bool) {
+	if len(line) == 0 || len(line) > 3 {
+		return 0, false
+	}
+	for _, digit := range line {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+	}
+	number, err := strconv.Atoi(line)
+	if err != nil || number < 1 || number > 400 {
+		return 0, false
+	}
+	return number, true
+}
+
+func InsertPageMarkerAfterFirstWord(line string, pageNumber int) string {
+	if pageNumber <= 0 {
+		return line
+	}
+	marker := fmt.Sprintf("〔pág. %d〕", pageNumber)
+	separator := strings.IndexAny(line, " \t")
+	if separator < 0 {
+		return line + " " + marker
+	}
+	return line[:separator] + " " + marker + line[separator:]
+}
+
+func JoinWrappedLine(previousText string, nextLine string) string {
+	if previousText == "" {
+		return nextLine
+	}
+	if nextLine == "" {
+		return previousText
+	}
+	previousRunes := []rune(previousText)
+	nextRunes := []rune(nextLine)
+	// A visible hyphen at the physical end of a line means word splitting.
+	// Do not remove hyphens inside text, e.g. "teórico-práctico".
+	if len(previousRunes) >= 2 && previousRunes[len(previousRunes)-1] == '-' &&
+		unicode.IsLetter(previousRunes[len(previousRunes)-2]) &&
+		unicode.IsLetter(nextRunes[0]) {
+		return string(previousRunes[:len(previousRunes)-1]) + nextLine
+	}
+	// The supplied PDF has the split "OMNIPO" / "TENTE" without a
+	// hyphen. This exception is deliberate, not a generic guessing rule.
+	if strings.HasSuffix(previousText, "OMNIPO") && strings.HasPrefix(nextLine, "TENTE") {
+		return previousText + nextLine
+	}
+	return previousText + " " + nextLine
+}
+
+func IsReadingHeading(line string) bool {
+	if _, found := ParseRolloHeading(line); found {
+		return true
+	}
+	if IsSignatureLine(line) || IsThirdPartHeading(line) {
+		return true
+	}
+	return strings.EqualFold(line, "SEGUNDA PARTE") || strings.EqualFold(line, "PRIMERA PARTE")
+}
+
+func IsSignatureLine(line string) bool {
+	return strings.EqualFold(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ".")), "Shiva y Shakti")
+}
+
+func SplitSignatureAndRolloHeadings(sourceText string) string {
+	// The PDF can glue the signature to either prose or a subsequent heading:
+	// "Trascendentales.Shiva y Shakti.Rollo №2".
+	// Match the complete signature, including its final point; the preceding
+	// sentence's punctuation is left untouched.
+	pattern := regexp.MustCompile(`(?i)Shiva[ \t]+y[ \t]+Shakti\.`)
+	return pattern.ReplaceAllString(sourceText, "\n\nShiva y Shakti\n\n")
+}
+
+func SplitInlineRolloHeadings(sourceText string) string {
+	pattern := regexp.MustCompile(`(?i)rollo[ \t]*(?:№|#|n[º°]\.?|n(?:u|ú)mero|nro\.?|n(?:u|ú)m\.?|no\.?)?[ \t]*[0-9]{1,2}`)
+	lines := strings.Split(sourceText, "\n")
+	for index, sourceLine := range lines {
+		matches := pattern.FindAllStringIndex(sourceLine, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		for matchIndex := len(matches) - 1; matchIndex >= 0; matchIndex-- {
+			start := matches[matchIndex][0]
+			end := matches[matchIndex][1]
+			if _, found := ParseRolloHeading(sourceLine[start:end]); !found {
+				continue
+			}
+			if IsIndexHeadingSuffix(sourceLine[end:]) {
+				continue
+			}
+			prefix := strings.TrimSpace(sourceLine[:start])
+			if prefix != "" && !strings.HasSuffix(prefix, ".") &&
+				!strings.HasSuffix(prefix, "Shiva y Shakti") {
+				continue
+			}
+			if prefix == "" && strings.TrimSpace(sourceLine[end:]) == "" {
+				continue
+			}
+			sourceLine = sourceLine[:start] + "\n\n" + sourceLine[start:end] + "\n\n" + sourceLine[end:]
+		}
+		lines[index] = sourceLine
+	}
+	return strings.Join(lines, "\n")
+}
+
+func IsIndexHeadingSuffix(remainder string) bool {
+	remainder = strings.TrimLeft(remainder, " \t")
+	if remainder == "" {
+		return false
+	}
+	if strings.HasPrefix(remainder, "…") || strings.HasPrefix(remainder, "⋯") {
+		return true
+	}
+	if strings.HasPrefix(remainder, ".…") || strings.HasPrefix(remainder, "..") {
+		return true
+	}
+	return false
+}
+
+// Heading matching is kept separate from text normalization.
+func NormalizeRolloHeadingLine(sourceLine string) string {
+	var builder strings.Builder
+	for _, character := range sourceLine {
+		if unicode.IsSpace(character) {
+			builder.WriteByte(' ')
+			continue
+		}
+		if unicode.Is(unicode.Cf, character) || character == '\u00ad' {
+			continue
+		}
+		builder.WriteRune(character)
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func TrimRolloHeadingSeparators(sourceText string) string {
+	return strings.TrimLeftFunc(sourceText, func(character rune) bool {
+		return unicode.IsSpace(character) || unicode.IsPunct(character) || unicode.IsSymbol(character) || character == 'º'
+	})
 }
 
 func ParseRolloHeading(line string) (int, bool) {
-	matches := rolloHeadingPattern.FindStringSubmatch(strings.TrimSpace(line))
-	if len(matches) != 2 {
+	heading := strings.ToLower(NormalizeRolloHeadingLine(line))
+	if !strings.HasPrefix(heading, "rollo") {
 		return 0, false
 	}
-	number, err := strconv.Atoi(matches[1])
-	if err != nil {
+	remainder := TrimRolloHeadingSeparators(heading[len("rollo"):])
+	for _, marker := range []string{"número", "numero", "núm", "num", "nro", "no", "n"} {
+		if strings.HasPrefix(remainder, marker) {
+			remainder = remainder[len(marker):]
+			break
+		}
+	}
+	remainder = TrimRolloHeadingSeparators(remainder)
+	digitCount := 0
+	for digitCount < len(remainder) && remainder[digitCount] >= '0' && remainder[digitCount] <= '9' {
+		digitCount++
+	}
+	if digitCount == 0 || digitCount > 2 {
+		return 0, false
+	}
+	trailingText := strings.TrimSpace(remainder[digitCount:])
+	if trailingText != "" && trailingText != "." {
+		return 0, false
+	}
+	number, err := strconv.Atoi(remainder[:digitCount])
+	if err != nil || number < 1 || number > ExpectedRolloCount {
 		return 0, false
 	}
 	return number, true
@@ -358,7 +591,6 @@ func IsThirdPartHeading(line string) bool {
 func BuildCompleteMarkdown(cleanedText string) string {
 	var builder strings.Builder
 	builder.WriteString("# Eka Tantra\n\n")
-
 	lines := strings.Split(cleanedText, "\n")
 	for _, line := range lines {
 		if number, found := ParseRolloHeading(line); found {
@@ -399,7 +631,6 @@ func SplitEkaTantraSections(cleanedText string) (DocumentSections, error) {
 				sectionBody.Reset()
 				continue
 			}
-
 			if currentRollo == ExpectedRolloCount && IsThirdPartHeading(line) {
 				sections.Rollos = append(sections.Rollos, RolloSection{
 					Number: currentRollo,
@@ -413,7 +644,6 @@ func SplitEkaTantraSections(cleanedText string) (DocumentSections, error) {
 		sectionBody.WriteString(line)
 		sectionBody.WriteByte('\n')
 	}
-
 	if !inThirdPart {
 		return sections, errors.New("third part was not found after rollo 39")
 	}
@@ -438,15 +668,13 @@ func WriteEkaTantraSections(stagingDirectory string, sections DocumentSections) 
 	if err := os.Mkdir(rollosDirectory, 0700); err != nil {
 		return fmt.Errorf("create rollos directory: %w", err)
 	}
-
 	for _, rollo := range sections.Rollos {
 		destinationRolloPath := filepath.Join(rollosDirectory, fmt.Sprintf("rollo-%02d.md", rollo.Number))
-		rolloMarkdown := fmt.Sprintf("# Rollo %d\n\n%s\n", rollo.Number, rollo.Body)
+		rolloMarkdown := fmt.Sprintf("## Rollo %d\n\n%s\n", rollo.Number, rollo.Body)
 		if err := WriteTextFile(destinationRolloPath, rolloMarkdown); err != nil {
 			return err
 		}
 	}
-
 	if err := WriteTextFile(
 		filepath.Join(stagingDirectory, "indice-y-prefacio.md"),
 		"# Índice y prefacio\n\n"+sections.Preface+"\n",
